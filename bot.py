@@ -33,15 +33,17 @@ import os
 import ctypes
 os.environ["PROJECT_NAME"] = 'iwyxdxl/WeChatBot_WXAUTO_SE'
 # 消息收发由 wxbot 兼容层驱动（wechatauto，适配微信 4.x 自绘渲染）
-from wxbot import WeChat
+from wxbot import WeChat, is_wechat_asset_url
 from wechatauto.param import WxParam
 WxParam.ENABLE_FILE_LOGGER = False
 WxParam.FORCE_MESSAGE_XBIAS = True
 
 
 # 生成用户昵称列表和prompt映射字典
+# 用了风格档案的用户可以不给 Prompt 文件，LISTEN_LIST 里那格会是空串；
+# 记忆文件名一类的地方都取 prompt_mapping，这里统一退回昵称，免得生出 '用户_.md'。
 user_names = [entry[0] for entry in LISTEN_LIST]
-prompt_mapping = {entry[0]: entry[1] for entry in LISTEN_LIST}
+prompt_mapping = {entry[0]: (entry[1] or entry[0]) for entry in LISTEN_LIST}
 
 # 编码检测和处理辅助函数
 def safe_read_file_with_encoding(file_path, fallback_content=""):
@@ -725,8 +727,190 @@ def on_user_message(user):
         user_names.append(user)
     reset_user_timer(user)
 
+# ==================== 聊天记录风格模仿（替代该用户的 Prompt）====================
+
+def history_users():
+    """勾选了「读聊天记录」的用户名单（每次读配置，改完重启即生效）。"""
+    users = get_dynamic_config('HISTORY_STYLE_USERS', [])
+    return list(users) if isinstance(users, (list, tuple)) else []
+
+
+def get_history_profile_path(user_id):
+    """风格档案的存放路径：HistoryProfiles/<昵称>.md（昵称里的非法字符替掉）。"""
+    folder = get_dynamic_config('HISTORY_PROFILE_DIR', 'HistoryProfiles') or 'HistoryProfiles'
+    safe = re.sub(r'[\\/:*?"<>|]', '_', str(user_id))
+    return os.path.join(root_dir, str(folder), f'{safe}.md')
+
+
+def get_history_profile(user_id):
+    """返回该用户的风格档案文本；没启用或还没生成档案时返回 None（继续用普通 prompt）。"""
+    if not user_id or user_id not in history_users():
+        return None
+    path = get_history_profile_path(user_id)
+    if not os.path.exists(path):
+        logger.warning(f"用户 {user_id} 开了「读聊天记录」但还没有档案，先用原 prompt；"
+                       f"请在配置页点「读取聊天记录」生成：{path}")
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            text = f.read().strip()
+        if text:
+            logger.debug(f"用户 {user_id} 使用聊天记录风格档案（{len(text)} 字）")
+            return text
+    except Exception as e:
+        logger.error(f"读取风格档案失败 {user_id}: {e}")
+    return None
+
+
+def get_history_profile_info(user_id):
+    """档案的生成时间，供日志和「是否过期」判断用；没有档案返回 0。"""
+    meta = get_history_profile_path(user_id) + '.meta'
+    try:
+        with open(meta, 'r', encoding='utf-8') as f:
+            return int(float(f.read().strip() or 0))
+    except Exception:
+        return 0
+
+
+# ==================== 按需读取聊天记录上下文 ====================
+
+history_contexts = {}          # {user_id: 最近聊天记录文本}
+history_context_injected = set()  # 已用过预读背景的会话（首条消息注入一次）
+history_context_lock = threading.Lock()
+history_context_warned = set()  # 「读不到记录」只在每个会话说一次，别刷屏
+
+
+def read_history_context(user_id, force=False):
+    """取该用户的聊天记录背景。
+
+    启动时预读一次放进缓存（``force=False`` 直接用缓存）；模型判断「需要上下文」
+    时传 ``force=True`` 重新读库，拿到的是此刻最新的记录。
+    """
+    if not user_id:
+        return ""
+    with history_context_lock:
+        cached = history_contexts.get(user_id, "")
+    if cached and not force:
+        return cached
+    _uname, text = wx.GetHistoryText(
+        user_id,
+        limit=_cfg_int('CONTEXT_MESSAGE_LIMIT', 30),
+        max_chars=_cfg_int('CONTEXT_MAX_CHARS', 2500))
+    if not text:
+        with history_context_lock:
+            first_time = user_id not in history_context_warned
+            if first_time:
+                history_context_warned.add(user_id)
+        if first_time:
+            logger.warning(
+                f"用户 {user_id} 读不到聊天记录（解析到的会话={username or '无'}）。"
+                f"常见原因：LISTEN_LIST 里的昵称和微信显示名不完全一致，或这个会话本地确实没有记录。"
+                f"之后同一条会话不再重复提醒。")
+        return cached
+    with history_context_lock:
+        history_contexts[user_id] = text
+    return text
+
+
+def preload_history_contexts():
+    """启动时给监听用户各预读一次聊天记录（开了风格档案的跳过）。"""
+    users = [u for u in list(user_names) if u not in history_users()]
+    if not users:
+        logger.info("没有需要预读聊天记录的用户。")
+        return
+    ok = 0
+    for user in users:
+        try:
+            if read_history_context(user):
+                ok += 1
+        except Exception as e:
+            logger.warning(f"预读聊天记录失败 {user}: {e}")
+        time.sleep(0.2)  # 别把读库打成尖峰
+    logger.info(f"聊天记录背景预读完成：{ok}/{len(users)} 个会话有内容。")
+
+
+def detect_need_history_context(message, user_id):
+    """让模型判断这条消息需不需要更多历史聊天记录才能接得上。
+
+    跟联网检测一个套路：开了辅助模型就用辅助模型，否则用主模型；只在
+    ENABLE_CONTEXT_FETCH 为真时被调用。
+    """
+    detection_prompt = f"""
+请判断以下用户消息是否需要参考你们之前的聊天聊天记录才能正确理解（例如：消息里出现「那个/上次/继续/之前说的」这类指代，或者在追问一件没交代背景的事）。
+用户消息："{message[:500]}"
+
+如果需要参考聊天记录，请只回答 "需要上下文"；
+如果不需要（例如：自我介绍、独立的问题、不需要前文的闲聊），请只回答 "不需要上下文"。
+不要添加任何其他解释。
+"""
+    try:
+        if get_dynamic_config('ENABLE_ASSISTANT_MODEL', ENABLE_ASSISTANT_MODEL):
+            response = get_assistant_response(detection_prompt, f"context_detection_{user_id}")
+        else:
+            response = get_deepseek_response(detection_prompt, user_id=f"context_detection_{user_id}",
+                                             store_context=False)
+        cleaned = (response or "").strip()
+        if "</think>" in cleaned:
+            cleaned = cleaned.split("</think>", 1)[1].strip()
+        need = ("需要上下文" in cleaned) and ("不需要上下文" not in cleaned)
+        logger.info(f"聊天记录上下文检测 - 用户 {user_id}: {cleaned[:20]} -> "
+                    f"{'需要' if need else '不需要'}")
+        return need
+    except Exception as e:
+        logger.error(f"聊天记录上下文检测失败 {user_id}: {e}")
+        return False
+
+
+def history_context_block(user_id, force=False):
+    """拼好可直接作为 system 消息注入的背景文本；没有内容时返回空串。"""
+    text = read_history_context(user_id, force=force)
+    if not text:
+        return ""
+    return ("以下是你们在本地的最近聊天记录（按时间正序，「我」是本机微信账号这一方），"
+            "用来说清来龙去脉，不要逐句复述：\n" + text)
+
+
+def inject_history_context(messages_to_send, user_id, message):
+    """按需把聊天记录背景塞进这次请求（ENABLE_CONTEXT_FETCH 开着才生效）。
+
+    首条消息用启动时预读的那份；之后每条先让模型判断「需不需要上下文」，
+    判要的时候才重新读库（拿到的是此刻最新的记录）。开了风格档案的用户跳过
+    ——档案本身就是从聊天记录生成的，再叠一份纯属浪费 token。
+    """
+    if not get_dynamic_config('ENABLE_CONTEXT_FETCH', False):
+        return
+    if user_id in history_users():
+        return
+    with history_context_lock:
+        first_turn = user_id not in history_context_injected
+        if first_turn:
+            history_context_injected.add(user_id)
+    if not first_turn and not detect_need_history_context(message, user_id):
+        return
+    block = history_context_block(user_id, force=not first_turn)
+    if not block:
+        return
+    # 合并进首条 system，不要新开第二条：本地模型（llama.cpp / ollama）的 GGUF
+    # chat template 里有 {% if message['role']=='system' and not loop.first %}
+    # raise_exception('System message must be at the beginning.')，非首位的 system
+    # 会让整次请求直接 500。合并是安全的 —— messages_to_send 每次调用都重建，
+    # 档案文本也每次现取，不会逐轮累积。
+    if messages_to_send and messages_to_send[0].get('role') == 'system':
+        messages_to_send[0]['content'] = f"{messages_to_send[0]['content']}\n\n{block}"
+    else:
+        messages_to_send.insert(0, {"role": "system", "content": block})
+    logger.info(f"为用户 {user_id} 注入聊天记录背景（{len(block)} 字，"
+                f"{'预读' if first_turn else '按需重读'}）")
+
+
 # 修改get_user_prompt函数
 def get_user_prompt(user_id):
+    # 启用了「聊天记录风格模仿」的用户：用生成的风格档案替代他的 prompt 文件，
+    # 记忆仍按原来的规则合并进去（不然开了档案就丢记忆了）。
+    profile = get_history_profile(user_id)
+    if profile:
+        return _apply_memory_to_prompt(user_id, profile)
+
     # 查找映射中的文件名，若不存在则使用user_id
     prompt_file = prompt_mapping.get(user_id, user_id)
     prompt_path = os.path.join(root_dir, 'prompts', f'{prompt_file}.md')
@@ -772,7 +956,12 @@ def get_user_prompt(user_id):
     
     if prompt_content is None:
         raise FileNotFoundError(f"无法读取Prompt文件内容: {prompt_path}")
-    
+
+    return _apply_memory_to_prompt(user_id, prompt_content)
+
+
+def _apply_memory_to_prompt(user_id, prompt_content):
+    """把记忆并到提示词里。普通 prompt 文件和聊天记录风格档案共用这套规则。"""
     # 处理记忆的上传
     if not get_dynamic_config('UPLOAD_MEMORY_TO_AI', UPLOAD_MEMORY_TO_AI):
         # 如果不上传记忆到AI，则移除所有记忆片段
@@ -901,6 +1090,9 @@ def get_deepseek_response(message, user_id, store_context=True, is_summary=False
             except FileNotFoundError as e:
                 logger.error(f"用户 {user_id} 的提示文件错误: {e}，使用默认提示。")
                 messages_to_send.append({"role": "system", "content": "你是一个乐于助人的助手。"})
+
+            # 按需注入聊天记录背景（ENABLE_CONTEXT_FETCH；开了风格档案的用户会自动跳过）
+            inject_history_context(messages_to_send, user_id, message)
 
             # 2. 管理并检索聊天历史记录
             with queue_lock: # 确保对 chat_contexts 的访问是线程安全的
@@ -2158,6 +2350,14 @@ def handle_wxauto_message(msg, who):
             # 使用正则表达式查找 URL
             url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
             urls_found = re.findall(url_pattern, original_content) # 仍在原始消息中查找URL
+
+            # 微信客户端自己的资源地址（表情/卡片 CDN、更新包、错误占位页）不是网页，
+            # 抓它只会得到「非 HTML / 提取不到文本」。实测这种地址在正文里出现过 462 次。
+            asset_urls = [u for u in urls_found if is_wechat_asset_url(u)]
+            if asset_urls:
+                urls_found = [u for u in urls_found if not is_wechat_asset_url(u)]
+                logger.info(f"已忽略 {len(asset_urls)} 个微信资源地址（不是网页链接）："
+                            f"{asset_urls[0][:70]}")
 
             if urls_found:
                 # 优先处理第一个找到的有效链接
@@ -4196,8 +4396,18 @@ def get_online_model_response(query: str, user_id: str) -> Optional[str]:
         return reply
 
     except Exception as e:
-        logger.error(f"调用在线 API 失败，用户: {user_id}: {e}", exc_info=True)
-        return "抱歉，在线搜索功能暂时出错了。"
+        msg = str(e)
+        low = msg.lower()
+        if any(k in low for k in ("401", "402", "invalid token", "insufficient",
+                                  "quota", "balance")) or "余额" in msg:
+            # 这类错误以前也回一句「抱歉，在线搜索功能暂时出错了。」，而那句话会被当成
+            # 「搜索到的参考信息」塞进主模型的提示词里，看起来就像"联网结果经常是空的"。
+            logger.error(f"联网搜索被跳过：在线 API 拒绝了凭据（{msg[:140]}）。"
+                         f"多半是 {ONLINE_BASE_URL} 的 Key 欠费或过期，"
+                         f"充值/换 Key 后重启机器人才恢复。")
+        else:
+            logger.error(f"调用在线 API 失败，用户: {user_id}: {e}", exc_info=True)
+        return None
 
 def monitor_memory_usage():
     import psutil
@@ -4458,6 +4668,23 @@ def main():
 
         # 预检查所有用户prompt文件
         for user in user_names:
+            # 开了「读聊天记录」并且档案已经生成：不再需要 prompt 文件
+            if user in history_users() and get_history_profile(user):
+                prof_path = get_history_profile_path(user)
+                try:
+                    size = os.path.getsize(prof_path)
+                except OSError:
+                    size = 0
+                logger.info(f"用户 {user} 人设来源：聊天记录风格档案"
+                            f"（{size} 字，{os.path.relpath(prof_path, root_dir)}，"
+                            f"生成于 {time.strftime('%m-%d %H:%M', time.localtime(get_history_profile_info(user))) if get_history_profile_info(user) else '未知时间'}）")
+                continue
+            # 档案文件在、名字却不在名单里：以前这里是静默回落 prompt，用户只会觉得
+            # 「导入了聊天记录怎么还用 prompt」，所以点名说清楚。
+            if user not in history_users() and os.path.exists(get_history_profile_path(user)):
+                logger.warning(f"用户 {user} 有风格档案文件，但 HISTORY_STYLE_USERS 里没有这个名字，"
+                               f"本次仍用 prompt 文件「{prompt_mapping.get(user, user)}」。"
+                               f"要用档案请在配置页勾选该用户的「读聊天记录」并保存配置。")
             prompt_file = prompt_mapping.get(user, user)
             prompt_path = os.path.join(root_dir, 'prompts', f'{prompt_file}.md')
             if not os.path.exists(prompt_path):
@@ -4527,6 +4754,15 @@ def main():
             recall_notice_thread.daemon = True
             recall_notice_thread.start()
             logger.info("撤回提醒已启用（发现新的撤回时会主动发一条提醒）。")
+
+        if get_dynamic_config('ENABLE_CONTEXT_FETCH', False):
+            logger.info("正在预读聊天记录背景...")
+            try:
+                preload_history_contexts()
+            except Exception as e:
+                logger.error(f"预读聊天记录失败: {e}", exc_info=True)
+        else:
+            logger.info("聊天记录上下文按需读取已禁用 (ENABLE_CONTEXT_FETCH = False)。")
 
         if get_dynamic_config('ENABLE_MOMENTS_WATCH', False):
             moment_watch_thread = threading.Thread(target=moment_watch_loop, name="MomentWatch")

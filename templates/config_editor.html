@@ -536,6 +536,27 @@
             margin-bottom: 10px;
             align-items: center;
         }
+        /* 用户列表每行多了「读聊天记录」勾选与生成按钮 */
+        #listen-list .entry {
+            grid-template-columns: 2fr 3fr auto auto auto;
+        }
+        .entry input[type="checkbox"] {
+            width: auto;
+            height: auto;
+            margin: 0;
+        }
+        .history-mode-label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 14px;
+            white-space: nowrap;
+            cursor: pointer;
+        }
+        .gen-profile-btn,
+        .fetch-models-btn {
+            white-space: nowrap;
+        }
         .entry input,
         .entry select {
             box-sizing: border-box;
@@ -1826,6 +1847,12 @@
                         <option value="{{ file }}">{{ file }}</option>
                         {% endfor %}
                     </select>
+                    <label class="history-mode-label" title="勾选后用该用户的聊天记录生成「模仿我」的风格档案，并替代他的 Prompt 文件">
+                        <input type="checkbox" class="history-mode" onchange="syncHistoryModeFields()">
+                        <span>读聊天记录</span>
+                    </label>
+                    <input type="hidden" name="history_mode_user" value="">
+                    <button type="button" class="gen-profile-btn" onclick="generateProfile(this)">读取聊天记录</button>
                     <button type="button" onclick="removeEntry(this)">删除</button>
                 `;
                 container.appendChild(div);
@@ -1836,6 +1863,161 @@
                 button.parentElement.remove();
             }
             window.removeEntry = removeEntry;
+
+            // 把每行「读聊天记录」的勾选状态同步到隐藏的 history_mode_user，
+            // 未勾选的复选框不会随表单提交，用隐藏域才不会让名单和昵称错位。
+            function syncHistoryModeFields() {
+                document.querySelectorAll('#listen-list .entry').forEach(function (row) {
+                    const box = row.querySelector('.history-mode');
+                    const hidden = row.querySelector('input[name="history_mode_user"]');
+                    const nick = row.querySelector('input[name="nickname"]');
+                    if (!box || !hidden) return;
+                    hidden.value = (box.checked && nick) ? nick.value.trim() : '';
+                });
+            }
+            window.syncHistoryModeFields = syncHistoryModeFields;
+
+            // 点「读取聊天记录」：让后端读本地聊天记录 + 调模型生成风格档案
+            async function generateProfile(button) {
+                const row = button.closest('.entry');
+                const nickInput = row ? row.querySelector('input[name="nickname"]') : null;
+                const nickname = nickInput ? nickInput.value.trim() : '';
+                if (!nickname) { alert('请先填好这个用户的微信昵称'); return; }
+
+                const oldText = button.textContent;
+                button.disabled = true;
+                button.textContent = '读取中...';
+                try {
+                    const resp = await fetch('/read_chat_history', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({nickname: nickname})
+                    });
+                    const data = await resp.json().catch(() => ({}));
+                    if (resp.ok && data.ok) {
+                        const box = row.querySelector('.history-mode');
+                        if (box && !box.checked) {
+                            box.checked = true;
+                            syncHistoryModeFields();
+                        }
+                        alert('已生成风格档案（' + data.chars + ' 字，取自 '
+                              + data.history_chars + ' 字聊天记录）\n使用模型：' + data.model
+                              + (data.custom_model ? '' : '（Chat 模型；在「档案生成模型」里可以单独指定）')
+                              + '\n保存位置：' + data.path
+                              + (data.enabled
+                                  ? '\n已自动勾选「读聊天记录」并写入 config.py（不用再到别处保存）'
+                                  : '\n注意：没能写入启用名单，请手动勾选「读聊天记录」后点保存配置')
+                              + (data.bot_running
+                                  ? '\n机器人正在运行：下一条消息起改用这份档案。'
+                                  : '')
+                              + '\n\n该用户将改用这份档案，不再使用他的 Prompt 文件。');
+                        button.textContent = '已生成，可重读';
+                        setTimeout(function () { button.textContent = oldText; button.disabled = false; }, 4000);
+                        return;
+                    }
+                    alert('读取失败：' + (data.error || ('HTTP ' + resp.status)));
+                } catch (err) {
+                    alert('读取失败：' + err);
+                }
+                button.disabled = false;
+                button.textContent = oldText;
+            }
+            window.generateProfile = generateProfile;
+
+            // 从 API 地址拉可用模型列表，填进对应的下拉框
+            async function fetchModels(scope) {
+                const map = {
+                    chat:     {url: 'finalApiUrl',      key: 'DEEPSEEK_API_KEY',   select: 'modelSelect',          custom: 'customModel',      final: 'finalModel'},
+                    assistant:{url: 'finalAssistantApiUrl', key: 'ASSISTANT_API_KEY', select: 'assistantModelSelect', custom: 'customAssistantModel', final: 'finalAssistantModel'},
+                    image:    {url: 'finalImageApiUrl', key: 'MOONSHOT_API_KEY',   select: 'imageModelSelect',     custom: 'customImageModel',  final: 'finalImageModel'},
+                    online:   {url: 'finalOnlineApiUrl',key: 'ONLINE_API_KEY',     select: 'onlineModelSelect',    custom: 'customOnlineModel', final: 'finalOnlineModel'},
+                    // 档案生成模型：地址与 Key 都跟着 Chat 走，所以这里只换一个下拉框
+                    profile:  {url: 'finalApiUrl',      key: 'DEEPSEEK_API_KEY',   select: 'profileModelSelect',   custom: 'customHistoryProfileModel', final: 'finalHistoryProfileModel', blank: '（留空，用 Chat 模型）'}
+                };
+                const ids = map[scope];
+                if (!ids) { alert('未知的模型区：' + scope); return; }
+                const urlEl = document.getElementById(ids.url) || document.getElementById(ids.url.replace('final', 'custom'));
+                const keyEl = document.querySelector('[name="' + ids.key + '"]');
+                const select = document.getElementById(ids.select);
+                if (!select) { alert('找不到模型下拉框'); return; }
+                const baseUrl = urlEl ? urlEl.value.trim() : '';
+                if (!baseUrl) { alert('请先选择或填写 API 地址'); return; }
+
+                const btn = document.getElementById('fetchModels_' + scope);
+                const oldText = btn ? btn.textContent : '';
+                if (btn) { btn.disabled = true; btn.textContent = '获取中...'; }
+                try {
+                    const resp = await fetch('/list_models', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({base_url: baseUrl, api_key: keyEl ? keyEl.value.trim() : ''})
+                    });
+                    const data = await resp.json().catch(() => ({}));
+                    if (!resp.ok || !data.ok) { alert('获取失败：' + (data.error || ('HTTP ' + resp.status))); return; }
+                    if (!data.models || !data.models.length) { alert('接口没返回任何模型：' + data.url); return; }
+                    const current = (document.getElementById(ids.final) || {}).value || select.value;
+                    select.innerHTML = '';
+                    if (ids.blank) {
+                        // 「留空」也要在列表里保留一个选项，否则拉完模型就没法退回默认了
+                        const blankOpt = document.createElement('option');
+                        blankOpt.value = '';
+                        blankOpt.textContent = ids.blank;
+                        if (!current) blankOpt.selected = true;
+                        select.appendChild(blankOpt);
+                    }
+                    data.models.forEach(function (m) {
+                        const o = document.createElement('option');
+                        o.value = m; o.textContent = m;
+                        if (m === current) o.selected = true;
+                        select.appendChild(o);
+                    });
+                    const other = document.createElement('option');
+                    other.value = 'other'; other.textContent = '其它（自定义）';
+                    select.appendChild(other);
+                    select.dispatchEvent(new Event('change'));
+                    if (current && data.models.indexOf(current) < 0) {
+                        const custom = document.getElementById(ids.custom);
+                        if (custom) { custom.value = current; select.value = 'other'; select.dispatchEvent(new Event('change')); }
+                    }
+                    alert('已获取 ' + data.models.length + ' 个模型：' + data.url);
+                } catch (err) {
+                    alert('获取失败：' + err);
+                } finally {
+                    if (btn) { btn.disabled = false; btn.textContent = oldText; }
+                }
+            }
+            window.fetchModels = fetchModels;
+
+            document.addEventListener('DOMContentLoaded', function () {
+                const form = document.getElementById('configForm');
+                if (form) form.addEventListener('submit', syncHistoryModeFields);
+                document.querySelectorAll('#listen-list .history-mode').forEach(function (box) {
+                    box.addEventListener('change', syncHistoryModeFields);
+                });
+
+                // 档案生成模型：下拉选择和手填框都同步到 HISTORY_PROFILE_MODEL 隐藏域
+                const profileSelect = document.getElementById('profileModelSelect');
+                const profileCustom = document.getElementById('customHistoryProfileModel');
+                const profileFinal = document.getElementById('finalHistoryProfileModel');
+                if (profileSelect && profileCustom && profileFinal) {
+                    const syncProfileModel = function () {
+                        if (profileSelect.value === 'other') {
+                            profileCustom.style.display = 'block';
+                            profileFinal.value = profileCustom.value.trim();
+                        } else {
+                            profileCustom.style.display = 'none';
+                            profileFinal.value = profileSelect.value;
+                        }
+                    };
+                    if (profileFinal.value) {
+                        profileSelect.value = 'other';
+                        profileCustom.value = profileFinal.value;
+                    }
+                    syncProfileModel();
+                    profileSelect.addEventListener('change', syncProfileModel);
+                    profileCustom.addEventListener('input', syncProfileModel);
+                }
+            });
 
 
             async function initBotStatus() {
@@ -3601,6 +3783,7 @@ document.getElementById('oneKeyDiagnosticButton').addEventListener('click', asyn
                     <div class="form-group">
                         <label>微信昵称/备注与对应Prompt配置:</label>
                         <div id="listen-list">
+                            {% set HISTORY_STYLE_USERS = config.HISTORY_STYLE_USERS or [] %}
                             {% for item in config.LISTEN_LIST %}
                             <div class="entry">
                                 <input type="text" name="nickname" value="{{ item[0] }}" placeholder="微信昵称" required>
@@ -3610,11 +3793,56 @@ document.getElementById('oneKeyDiagnosticButton').addEventListener('click', asyn
                                     <option value="{{ file }}" {% if item[1] == file %}selected{% endif %}>{{ file }}</option>
                                     {% endfor %}
                                 </select>
+                                <label class="history-mode-label" title="勾选后用该用户的聊天记录生成「模仿我」的风格档案，并替代他的 Prompt 文件">
+                                    <input type="checkbox" class="history-mode" {% if item[0] in HISTORY_STYLE_USERS %}checked{% endif %}>
+                                    <span>读聊天记录</span>
+                                </label>
+                                <input type="hidden" name="history_mode_user" value="{{ item[0] if item[0] in HISTORY_STYLE_USERS else '' }}">
+                                <button type="button" class="gen-profile-btn" onclick="generateProfile(this)">读取聊天记录</button>
                                 <button type="button" onclick="removeEntry(this)">删除</button>
                             </div>
                             {% endfor %}
                         </div>
                         <button type="button" onclick="addEntry()" style="margin-top:10px;">添加用户</button>
+                    </div>
+
+                    <div class="form-group">
+                        <h3>读聊天记录（模仿我的说话风格）</h3>
+                        <small>
+                            勾选某一行后点「读取聊天记录」：程序会读该会话在本地的聊天记录，让模型提炼出<b>「我」这一方的说话风格</b>与近期上下文，存成风格档案（<code>HistoryProfiles/&lt;昵称&gt;.md</code>）。<br>
+                            <b>启用后该用户不再使用上面选的 Prompt 文件</b>（记忆仍然照常合并）；想换回来取消勾选并保存即可。<br>
+                            只读本地微信数据库，不操作微信界面；聊天记录的内容会进模型上下文，请注意隐私。
+                        </small>
+                        <label for="profileModelSelect" style="display:block; margin-top:10px;">档案生成模型（留空 = 用上面「Chat 模型」）:</label>
+                        <select id="profileModelSelect" name="temp_HISTORY_PROFILE_MODEL" style="max-width:340px;">
+                            <option value="">（留空，用 Chat 模型）</option>
+                            <option value="other">其它（自定义）</option>
+                        </select>
+                        <input type="text" id="customHistoryProfileModel" class="custom-input" placeholder="手填模型名（同一 API 地址下要真实存在）" style="display:none;">
+                        <input type="hidden" id="finalHistoryProfileModel" name="HISTORY_PROFILE_MODEL" value="{{ config.HISTORY_PROFILE_MODEL or '' }}">
+                        <button type="button" class="fetch-models-btn" id="fetchModels_profile" onclick="fetchModels('profile')" title="按「Chat 模型」的 API 地址与 Key 调 /models 接口列出模型；档案生成用的就是这一套地址与 Key，只换模型名">获取可用模型</button>
+                        <small style="margin-left:8px;">典型用法：Chat 用本地慢模型，档案生成交给一个快模型。<br>
+                            API 地址与 Key 沿用「Chat 模型配置」那两栏，这里只决定用哪个模型名。<br>
+                            这一栏改完要先点右下角「保存配置」再生成档案 —— 生成时读的是已经落盘的 config.py。</small>
+                        <label for="HISTORY_READ_LIMIT_input" style="display:block; margin-top:10px;">生成档案时读取最近多少条消息:</label>
+                        <input type="number" step="10" min="10" id="HISTORY_READ_LIMIT_input" name="HISTORY_READ_LIMIT" value="{{ config.HISTORY_READ_LIMIT or 60 }}">
+                        <label for="HISTORY_PROFILE_MAX_CHARS_input" style="display:block; margin-top:10px;">风格档案字数上限:</label>
+                        <input type="number" step="200" min="500" id="HISTORY_PROFILE_MAX_CHARS_input" name="HISTORY_PROFILE_MAX_CHARS" value="{{ config.HISTORY_PROFILE_MAX_CHARS or 3000 }}">
+                    </div>
+
+                    <div class="form-group">
+                        <div class="switch-item">
+                            <label>按需读取聊天上下文（未勾选「读聊天记录」的用户）</label>
+                            <div class="switch"><label class="switch-label"><input type="checkbox" name="ENABLE_CONTEXT_FETCH" {% if config.ENABLE_CONTEXT_FETCH %}checked{% endif %}><span class="slider round"></span></label></div>
+                        </div>
+                        <small>
+                            开启后：程序启动时先给每个监听用户预读一次聊天记录做背景；之后每条消息先让模型判断「需不需要更多上下文」，判要的时候再重新读一次库（拿到的是此刻最新的记录）。<br>
+                            会让每次判断多一次模型调用、注入的背景也占 token，默认关闭。
+                        </small>
+                        <label for="CONTEXT_MESSAGE_LIMIT_input" style="display:block; margin-top:10px;">每次读取最近多少条消息:</label>
+                        <input type="number" step="5" min="5" id="CONTEXT_MESSAGE_LIMIT_input" name="CONTEXT_MESSAGE_LIMIT" value="{{ config.CONTEXT_MESSAGE_LIMIT or 30 }}">
+                        <label for="CONTEXT_MAX_CHARS_input" style="display:block; margin-top:10px;">注入背景的字数上限:</label>
+                        <input type="number" step="200" min="500" id="CONTEXT_MAX_CHARS_input" name="CONTEXT_MAX_CHARS" value="{{ config.CONTEXT_MAX_CHARS or 2500 }}">
                     </div>
                     <small>提示：修改了用户对应的Prompt文件后保存配置时将自动清除该用户的上下文记忆。</small>
                 </div>
@@ -3788,6 +4016,7 @@ document.getElementById('oneKeyDiagnosticButton').addEventListener('click', asyn
                         </select>
                         <input type="text" id="customModel" placeholder="请输入自定义模型名称" class="custom-input" value="{{ config.MODEL if config.MODEL not in popular_models else '' }}">
                         <input type="hidden" id="finalModel" name="MODEL" value="{{ config.MODEL }}">
+                        <button type="button" class="fetch-models-btn" id="fetchModels_chat" onclick="fetchModels('chat')" title="按上方 API 地址与 API Key 调用 /models 接口，把返回的模型填进左侧下拉框">获取可用模型</button><small style="margin-left:8px;">也可直接在输入框里手填自定义模型名。</small>
                     </div>
                     <div class="form-group">
                         <label>API Key:</label>
@@ -3846,6 +4075,7 @@ document.getElementById('oneKeyDiagnosticButton').addEventListener('click', asyn
                             </select>
                             <input type="text" id="customAssistantModel" placeholder="请输入自定义辅助模型名称" class="custom-input" value="{{ config.ASSISTANT_MODEL if config.ASSISTANT_MODEL not in assistant_popular_models else '' }}">
                             <input type="hidden" id="finalAssistantModel" name="ASSISTANT_MODEL" value="{{ config.ASSISTANT_MODEL }}">
+                        <button type="button" class="fetch-models-btn" id="fetchModels_assistant" onclick="fetchModels('assistant')" title="按上方 API 地址与 API Key 调用 /models 接口，把返回的模型填进左侧下拉框">获取可用模型</button><small style="margin-left:8px;">也可直接在输入框里手填自定义模型名。</small>
                         </div>
                         <div class="form-group">
                             <label>辅助模型API Key:</label>
@@ -3906,6 +4136,7 @@ document.getElementById('oneKeyDiagnosticButton').addEventListener('click', asyn
                         <select id="imageModelSelect" name="temp_IMAGE_MODEL"></select>
                         <input type="text" id="customImageModel" class="custom-input" placeholder="请输入自定义模型名称" {% if config.MOONSHOT_MODEL not in ['moonshot-v1-128k-vision-preview','moonshot-v1-32k-vision-preview','moonshot-v1-8k-vision-preview','gpt-4o','deepseek-flash'] %} value="{{ config.MOONSHOT_MODEL }}" style="display:block;" {% endif %}>
                         <input type="hidden" id="finalImageModel" name="MOONSHOT_MODEL" value="{{ config.MOONSHOT_MODEL }}">
+                        <button type="button" class="fetch-models-btn" id="fetchModels_image" onclick="fetchModels('image')" title="按上方 API 地址与 API Key 调用 /models 接口，把返回的模型填进左侧下拉框">获取可用模型</button><small style="margin-left:8px;">也可直接在输入框里手填自定义模型名。</small>
                     </div>
                     <div class="form-group">
                         <label>API Key:</label>
@@ -3945,6 +4176,7 @@ document.getElementById('oneKeyDiagnosticButton').addEventListener('click', asyn
                         <select id="onlineModelSelect" name="temp_ONLINE_MODEL"></select>
                         <input type="text" id="customOnlineModel" class="custom-input" placeholder="请输入自定义模型名称 (请使用带联网功能的模型)" {% if config.ONLINE_MODEL not in ['deepseek-r1-searching','net-gpt-4o-mini'] %} value="{{ config.ONLINE_MODEL }}" style="display:block;" {% endif %}>
                         <input type="hidden" id="finalOnlineModel" name="ONLINE_MODEL" value="{{ config.ONLINE_MODEL }}">
+                        <button type="button" class="fetch-models-btn" id="fetchModels_online" onclick="fetchModels('online')" title="按上方 API 地址与 API Key 调用 /models 接口，把返回的模型填进左侧下拉框">获取可用模型</button><small style="margin-left:8px;">也可直接在输入框里手填自定义模型名。</small>
                     </div>
                     <div class="form-group">
                         <label>联网API Key:</label>

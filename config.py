@@ -12,14 +12,14 @@
 
 # 用户列表(请配置要和bot说话的账号的微信昵称！)
 # 例如：LISTEN_LIST = [['微信名1', '角色1'],['微信名2', '角色2']]
-LISTEN_LIST = [['你的微信昵称', '角色1']]
+LISTEN_LIST = [['微信名1', '角色1']]
 
 # DeepSeek API 配置
-DEEPSEEK_API_KEY = 'YOUR_API_KEY'
+DEEPSEEK_API_KEY = 'public'
 # 硅基流动API注册地址，免费15元额度 https://cloud.siliconflow.cn/i/Dlavkw5R
-DEEPSEEK_BASE_URL = 'https://vg.v1api.cc/v1'
+DEEPSEEK_BASE_URL = 'https://opencode.ai/zen/v1'
 # 硅基流动API的模型
-MODEL = 'deepseek-r1-searching'
+MODEL = 'space-bunny-free'
 # 用户和AI对话轮数
 MAX_GROUPS = 5
 
@@ -38,9 +38,9 @@ TEMPERATURE = 0.7
 #   MOONSHOT_BASE_URL = 'https://api.deepseek.com'
 #   MOONSHOT_MODEL = 'deepseek-flash'
 #   下面这个 API Key 填 DeepSeek 官方 Key（与 Chat 的 DEEPSEEK_API_KEY 可以不同）
-MOONSHOT_API_KEY = 'YOUR_API_KEY'
-MOONSHOT_BASE_URL = 'https://vg.v1api.cc/v1'
-MOONSHOT_MODEL = 'gpt-4o'
+MOONSHOT_API_KEY = 'public'
+MOONSHOT_BASE_URL = 'https://opencode.ai/zen/v1'
+MOONSHOT_MODEL = 'space-bunny-free'
 MOONSHOT_TEMPERATURE = 0.5
 ENABLE_IMAGE_RECOGNITION = True
 ENABLE_EMOJI_RECOGNITION = True
@@ -85,6 +85,28 @@ UPLOAD_MEMORY_TO_AI = True
 # 记忆存储方式：True = 保存到单独的JSON文件，False = 保存到prompt文件中
 SAVE_MEMORY_TO_SEPARATE_FILE = True
 CORE_MEMORY_DIR = 'CoreMemory'
+
+# ===== 聊天记录风格模仿 与 上下文读取 =====
+# 名单里的用户：不再使用他的 Prompt 文件，改用「读取聊天记录」生成的风格档案
+# （保存在 HistoryProfiles/<昵称>.md，在配置页的用户列表里勾选并生成）
+HISTORY_STYLE_USERS = []
+# 风格档案目录（相对程序根目录）
+HISTORY_PROFILE_DIR = 'HistoryProfiles'
+# 生成档案时读最近多少条聊天记录
+HISTORY_READ_LIMIT = 60
+# 用哪个模型生成风格档案；留空 = 用「Chat 模型配置」里的 MODEL。
+# API 地址与 Key 仍沿用 Chat 模型那一套（只换模型名）
+HISTORY_PROFILE_MODEL = ''
+# 风格档案最长多少字符（超出截断，避免吃光上下文）
+HISTORY_PROFILE_MAX_CHARS = 3000
+
+# 未启用风格档案的用户：启动时先预读一次聊天记录做背景，
+# 之后由模型判断这条消息是否需要更多上下文，需要时再重新读一次
+ENABLE_CONTEXT_FETCH = True
+# 每次读取最近多少条消息
+CONTEXT_MESSAGE_LIMIT = 30
+# 注入的背景文本上限（字符）
+CONTEXT_MAX_CHARS = 2500
 
 # 是否接收全部群聊消息
 ACCEPT_ALL_GROUP_CHAT_MESSAGES = False
@@ -140,9 +162,9 @@ MOMENTS_WATCH_INTERVAL = 120
 
 # 联网API配置
 ENABLE_ONLINE_API = True
-ONLINE_BASE_URL = 'https://vg.v1api.cc/v1'
-ONLINE_MODEL = 'deepseek-r1-searching'
-ONLINE_API_KEY = 'YOUR_API_KEY'
+ONLINE_BASE_URL = 'https://opencode.ai/zen/v1'
+ONLINE_MODEL = 'space-bunny-free'
+ONLINE_API_KEY = 'public'
 ONLINE_API_TEMPERATURE = 0.5
 ONLINE_API_MAX_TOKEN = 2000
 SEARCH_DETECTION_PROMPT = '是否需要查询今天的天气、最新的新闻事件、特定网站的内容、股票价格、特定人物的最新动态、歌词、小说情节、游戏内容、网络热梗、历史信息等'
@@ -169,10 +191,10 @@ REMOVE_PARENTHESES = False
 
 # 是否使用辅助模型
 ENABLE_ASSISTANT_MODEL = True
-ASSISTANT_BASE_URL = 'https://vg.v1api.cc/v1'
-ASSISTANT_MODEL = 'gpt-4o-mini'
-ASSISTANT_API_KEY = 'YOUR_API_KEY'
-ASSISTANT_TEMPERATURE = 0.3
+ASSISTANT_BASE_URL = 'https://opencode.ai/zen/v1'
+ASSISTANT_MODEL = 'space-bunny-free'
+ASSISTANT_API_KEY = 'public'
+ASSISTANT_TEMPERATURE = 0.2
 ASSISTANT_MAX_TOKEN = 1000
 USE_ASSISTANT_FOR_MEMORY_SUMMARY = True
 

@@ -181,7 +181,9 @@ def validate_config_types(config_path):
                      'MAX_MESSAGE_LOG_ENTRIES', 'MAX_MEMORY_NUMBER', 'PORT', 'ONLINE_API_MAX_TOKEN',
                      'REQUESTS_TIMEOUT', 'MAX_WEB_CONTENT_LENGTH', 'RESTART_INACTIVITY_MINUTES',
                      'GROUP_CHAT_RESPONSE_PROBABILITY', 'ASSISTANT_MAX_TOKEN', 'MOMENTS_QUERY_LIMIT',
-                     'RECALL_BACKFILL', 'RECALL_SCAN_LIMIT', 'MOMENTS_WATCH_INTERVAL']
+                     'RECALL_BACKFILL', 'RECALL_SCAN_LIMIT', 'MOMENTS_WATCH_INTERVAL',
+                     'HISTORY_READ_LIMIT', 'HISTORY_PROFILE_MAX_CHARS',
+                     'CONTEXT_MESSAGE_LIMIT', 'CONTEXT_MAX_CHARS']
         
         # 检查应该是浮点数但被保存为字符串的配置项  
         float_fields = ['TEMPERATURE', 'MOONSHOT_TEMPERATURE', 'MIN_COUNTDOWN_HOURS', 'MAX_COUNTDOWN_HOURS',
@@ -394,16 +396,37 @@ def submit_config():
 
         nicknames_from_form = request.form.getlist('nickname')
         prompt_files_from_form = request.form.getlist('prompt_file')
-        
+
+        # 「读聊天记录」勾选：每行一个隐藏域 history_mode_user，勾上时前端把该行的
+        # 昵称写进去，没勾就是空串 —— 这样未勾选的复选框不提交也不会把列表错位。
+        # 必须先算这份，下面建 LISTEN_LIST 时要用它决定「没选 Prompt 的行」留不留。
+        history_users_from_form = []
+        for value in request.form.getlist('history_mode_user'):
+            value = (value or '').strip()
+            if value and value not in history_users_from_form:
+                history_users_from_form.append(value)
+        new_values_for_config_py['HISTORY_STYLE_USERS'] = history_users_from_form
+
         processed_listen_list = []
+        dropped_rows = []
         if nicknames_from_form and prompt_files_from_form and len(nicknames_from_form) == len(prompt_files_from_form):
             for nick, pf in zip(nicknames_from_form, prompt_files_from_form):
                 nick_stripped = nick.strip()
                 pf_stripped = pf.strip()
-                if nick_stripped and pf_stripped: 
+                if not nick_stripped:
+                    continue
+                # 用了风格档案的用户本来就不需要 Prompt 文件（bot 会拿档案顶掉它），
+                # 以前的写法是「Prompt 没选就整行丢掉」——结果这种人保存后直接从监听
+                # 列表里消失，或者退回默认 prompt。现在保留空 Prompt 的行。
+                if pf_stripped or nick_stripped in history_users_from_form:
                     processed_listen_list.append([nick_stripped, pf_stripped])
+                else:
+                    dropped_rows.append(nick_stripped)
+        if dropped_rows:
+            app.logger.warning('这些用户没选 Prompt 文件、也没勾选「读聊天记录」，'
+                               '本次保存未写入 LISTEN_LIST：%s' % dropped_rows)
         new_values_for_config_py['LISTEN_LIST'] = processed_listen_list
-        
+
         new_listen_list_map = {item[0]: item[1] for item in processed_listen_list}
         
         users_whose_prompt_changed = []
@@ -421,7 +444,8 @@ def submit_config():
             'ENABLE_ASSISTANT_MODEL', 'USE_ASSISTANT_FOR_MEMORY_SUMMARY', 'ENABLE_FORUM_CUSTOM_MODEL',
             'IGNORE_GROUP_CHAT_FOR_AUTO_MESSAGE', 'ENABLE_SENSITIVE_CONTENT_CLEARING', 'SAVE_MEMORY_TO_SEPARATE_FILE',
             'ENABLE_TEXT_COMMANDS', 'ENABLE_RECALL_GUARD', 'ENABLE_MOMENTS_COMMAND',
-            'ENABLE_RECALL_NOTICE', 'ENABLE_MOMENTS_INTERACTIONS', 'ENABLE_MOMENTS_WATCH'
+            'ENABLE_RECALL_NOTICE', 'ENABLE_MOMENTS_INTERACTIONS', 'ENABLE_MOMENTS_WATCH',
+            'ENABLE_CONTEXT_FETCH'
         ]
         for field in boolean_fields:
             new_values_for_config_py[field] = field in request.form
@@ -702,6 +726,7 @@ def update_config(new_values):
                 lines = f.readlines()
 
             new_lines = []
+            existing_keys = set()
             for line in lines:
                 line_stripped = line.strip()
                 # 保留注释或空行
@@ -713,6 +738,7 @@ def update_config(new_values):
                 match = re.match(r'^\s*(\w+)\s*=.*', line)
                 if match:
                     var_name = match.group(1)
+                    existing_keys.add(var_name)
                     # 如果新配置中包含此变量，更新其值
                     if var_name in new_values:
                         value = new_values[var_name]
@@ -724,6 +750,18 @@ def update_config(new_values):
                 else:
                     # 如果行不符合格式，则直接保留
                     new_lines.append(line)
+
+            # 追加 config.py 里还没有的新键。缺这一步的话，升级用户（config.py
+            # 还是旧版本那份）在网页里填了新字段也会静默丢掉，界面下次打开又变回空。
+            # 只追加 get_default_config 里登记过的键，免得把表单里非配置的字段写进 config.py。
+            known_defaults = get_default_config()
+            missing = [k for k in new_values if k not in existing_keys and k in known_defaults]
+            if missing:
+                order = list(known_defaults.keys())
+                missing.sort(key=lambda k: order.index(k))
+                new_lines.append('\n# ===== 由配置界面追加的新增配置项 =====\n')
+                for key in missing:
+                    new_lines.append(f"{key} = {repr(new_values[key])}\n")
 
             # 写入临时文件，确保写入成功后再替换原文件
             with tempfile.NamedTemporaryFile('w', delete=False, dir=script_dir, encoding='utf-8') as temp_file:
@@ -957,7 +995,7 @@ def index():
                 'ENABLE_ASSISTANT_MODEL', 'USE_ASSISTANT_FOR_MEMORY_SUMMARY',
                 'IGNORE_GROUP_CHAT_FOR_AUTO_MESSAGE', 'ENABLE_SENSITIVE_CONTENT_CLEARING', 'SAVE_MEMORY_TO_SEPARATE_FILE',
                 'ENABLE_RECALL_GUARD', 'ENABLE_MOMENTS_COMMAND', 'ENABLE_RECALL_NOTICE',
-                'ENABLE_MOMENTS_INTERACTIONS', 'ENABLE_MOMENTS_WATCH'
+                'ENABLE_MOMENTS_INTERACTIONS', 'ENABLE_MOMENTS_WATCH', 'ENABLE_CONTEXT_FETCH'
             ]
             for field in boolean_fields_from_editor:
                  # 确保这些字段在表单中存在才处理，否则它们可能来自 quick_start
@@ -1112,6 +1150,180 @@ def delete_prompt(filename):
         except Exception as e:
             return str(e), 500
     return "无效文件", 400
+
+@app.route('/list_models', methods=['POST'])
+@login_required
+def list_models():
+    """向填好的 API 地址要一份可用模型列表（OpenAI 兼容的 GET /models）。
+
+    只读操作：拿到什么返回什么，不写配置。
+    """
+    import urllib.request
+    import urllib.error
+
+    payload = request.get_json(silent=True) or {}
+    base_url = (payload.get('base_url') or '').strip()
+    api_key = (payload.get('api_key') or '').strip()
+    if not base_url:
+        cfg = parse_config()
+        base_url = cfg.get('DEEPSEEK_BASE_URL', '')
+    if is_hidden_api_key(api_key):
+        api_key = ''
+    if not api_key:
+        api_key = parse_config().get('DEEPSEEK_API_KEY', '')
+    if not base_url:
+        return jsonify({'ok': False, 'error': '没有填 API 地址'}), 400
+    if '://' not in base_url:
+        base_url = 'https://' + base_url
+
+    url = base_url.rstrip('/') + '/models'
+    req = urllib.request.Request(url, method='GET')
+    req.add_header('Authorization', 'Bearer ' + api_key)
+    req.add_header('Accept', 'application/json')
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode('utf-8', 'replace'))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', 'replace')[:200]
+        app.logger.warning('获取模型列表失败 %s: %s', url, body)
+        return jsonify({'ok': False, 'error': '接口返回 %s：%s' % (e.code, body or e.reason)}), 200
+    except Exception as e:
+        app.logger.warning('获取模型列表异常 %s: %s', url, e)
+        return jsonify({'ok': False, 'error': '连不上 %s（%s）' % (url, e)}), 200
+
+    items = data.get('data') or data.get('models') or []
+    models = []
+    for it in items:
+        name = it.get('id') if isinstance(it, dict) else it
+        if name and str(name) not in models:
+            models.append(str(name))
+    models.sort()
+    return jsonify({'ok': True, 'url': url, 'models': models})
+
+
+PROFILE_PROMPT_HEADER = (
+    "下面是一段微信聊天记录，其中「我」这一方就是你要模仿的人（本机账号主人）。"
+    "请只根据聊天记录，写一份可以直接当作系统提示词用的文本，让 AI 以后**代替「我」本人**"
+    "跟对方聊天。要求：\n"
+    "1. 先总结「我」的说话风格：句子长短、用词习惯、口头禅、语气（冷淡/热情/爱开玩笑）、"
+    "是否常用表情或网络用语、回复快慢和分几段发。\n"
+    "2. 再给出「我」和对方的关系与最近聊的事情（上下文中出现过的话题、约定、称呼），"
+    "只写聊天记录里确实有的，不要编造细节。\n"
+    "3. 最后写 3-6 条「模仿要点」，用祈使句写给 AI，例如「回复尽量短，一句一条」。\n"
+    "4. 全文用中文，不超过 600 字，不要加\"以下是\"\"好的\"这类开场白，不要复述聊天记录原文大段内容。\n\n"
+    "聊天记录：\n")
+
+
+def resolve_profile_model(cfg):
+    """风格档案用哪个模型：HISTORY_PROFILE_MODEL 填了就用它，否则用 Chat 模型。
+
+    单独放成函数是为了好测 —— 这条链路上「留空」和「填了」的优先级一旦写反，
+    用户在网页里填的模型就会悄悄不生效。
+    """
+    custom = (cfg.get('HISTORY_PROFILE_MODEL') or '').strip()
+    if custom and custom not in ('YOUR_MODEL', 'None'):
+        return custom, True
+    return (cfg.get('MODEL') or '').strip(), False
+
+
+@app.route('/read_chat_history', methods=['POST'])
+@login_required
+def read_chat_history():
+    """读某个用户的聊天记录，让模型生成「模仿我」的风格档案并落盘。
+
+    生成的档案会被 bot 用来**替代**该用户的 Prompt 文件（见 config.py 的
+    HISTORY_STYLE_USERS）。只读微信数据库 + 写自己的档案目录，不碰界面。
+    """
+    payload = request.get_json(silent=True) or {}
+    nickname = (payload.get('nickname') or '').strip()
+    if not nickname:
+        return jsonify({'ok': False, 'error': '没有指定用户昵称'}), 400
+
+    cfg = parse_config()
+    limit = int(cfg.get('HISTORY_READ_LIMIT', 60) or 60)
+    max_chars = int(cfg.get('HISTORY_PROFILE_MAX_CHARS', 3000) or 3000)
+    folder = cfg.get('HISTORY_PROFILE_DIR', 'HistoryProfiles') or 'HistoryProfiles'
+
+    try:
+        import wxbot
+        username, history = wxbot.read_history_text(nickname, limit=limit,
+                                                    max_chars=max(2000, max_chars * 2))
+    except Exception as e:
+        app.logger.error('读取聊天记录失败: %s', e, exc_info=True)
+        return jsonify({'ok': False, 'error': '读取聊天记录出错：%s' % e}), 200
+    if not history:
+        msg = ('本地数据库里找不到这个会话的聊天记录（昵称要和微信里显示的完全一致，'
+               '或者对方确实没和这台机器聊过天）')
+        return jsonify({'ok': False, 'error': msg}), 200
+
+    try:
+        # 每次现读 config.py：编辑器进程已经把 config 模块 import 过，
+        # `from config import ...` 拿到的是启动时的旧值，刚在网页里改完 Key
+        # 就点按钮会用错凭据（/generate_prompt 就有这个毛病，这里不再照抄）。
+        chat_cfg = parse_config()
+        chat_key = (chat_cfg.get('DEEPSEEK_API_KEY') or '').strip()
+        chat_url = (chat_cfg.get('DEEPSEEK_BASE_URL') or '').strip()
+        chat_model, used_custom = resolve_profile_model(chat_cfg)
+        if not chat_key or chat_key == 'YOUR_API_KEY':
+            return jsonify({'ok': False, 'error': '还没配 Chat 模型的 API Key（配置页「Chat 模型配置」）'}), 200
+        if not chat_url:
+            return jsonify({'ok': False, 'error': 'Chat 模型的 API 地址没填'}), 200
+        if not chat_model:
+            return jsonify({'ok': False, 'error':
+                            '模型名是空的：请在「档案生成模型」里填一个，或在「Chat 模型配置」的模型名里填'}), 200
+        client = openai.OpenAI(base_url=chat_url, api_key=chat_key)
+        resp = client.chat.completions.create(
+            model=chat_model,
+            messages=[{"role": "user", "content": PROFILE_PROMPT_HEADER + history}],
+            temperature=0.5,
+        )
+        profile = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        app.logger.error('生成风格档案失败: %s', e, exc_info=True)
+        return jsonify({'ok': False, 'error': '模型生成失败：%s' % e}), 200
+    if not profile:
+        return jsonify({'ok': False, 'error': '模型返回了空内容，请重试'}), 200
+    if len(profile) > max_chars:
+        profile = profile[:max_chars]
+
+    safe = re.sub(r'[\\/:*?"<>|]', '_', nickname)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir = os.path.join(script_dir, folder)
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, safe + '.md')
+    tmp = path + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(profile + "\n")
+        shutil.move(tmp, path)
+        with open(path + '.meta', 'w', encoding='utf-8') as f:
+            f.write(str(time.time()))
+    except Exception as e:
+        app.logger.error('写风格档案失败: %s', e, exc_info=True)
+        return jsonify({'ok': False, 'error': '保存失败：%s' % e}), 200
+
+    # 生成即启用：把昵称并进 HISTORY_STYLE_USERS。以前「生成档案」和「勾选启用+保存」
+    # 是两步，中间只要页面刷新一下勾选就丢了，结果档案躺在磁盘上、bot 还在用 prompt。
+    enabled = nickname in (cfg.get('HISTORY_STYLE_USERS') or [])
+    if not enabled:
+        users = list(cfg.get('HISTORY_STYLE_USERS') or [])
+        users.append(nickname)
+        try:
+            update_config({'HISTORY_STYLE_USERS': users})
+            enabled = True
+            app.logger.info('已把 %s 加入 HISTORY_STYLE_USERS（生成即启用）' % nickname)
+        except Exception as e:
+            app.logger.error('写入 HISTORY_STYLE_USERS 失败: %s', e, exc_info=True)
+
+    app.logger.info('已为 %s 生成风格档案（模型 %s，聊天记录 %d 字 -> 档案 %d 字，来自 %s）',
+                    nickname, chat_model, len(history), len(profile), username or '未知会话')
+    return jsonify({'ok': True, 'nickname': nickname, 'username': username,
+                    'model': chat_model, 'custom_model': used_custom,
+                    'enabled': enabled,
+                    'bot_running': bool(bot_process and bot_process.poll() is None),
+                    'history_chars': len(history), 'chars': len(profile),
+                    'path': os.path.relpath(path, script_dir), 'profile': profile})
+
 
 @app.route('/generate_prompt', methods=['POST'])
 @login_required
@@ -3578,6 +3790,14 @@ def get_default_config():
         "ENABLE_REMINDERS": True,
         "ALLOW_REMINDERS_IN_QUIET_TIME": True,
         "USE_VOICE_CALL_FOR_REMINDERS": False,
+        "HISTORY_STYLE_USERS": [],
+        "HISTORY_PROFILE_DIR": "HistoryProfiles",
+        "HISTORY_READ_LIMIT": 60,
+        "HISTORY_PROFILE_MODEL": "",
+        "HISTORY_PROFILE_MAX_CHARS": 3000,
+        "ENABLE_CONTEXT_FETCH": False,
+        "CONTEXT_MESSAGE_LIMIT": 30,
+        "CONTEXT_MAX_CHARS": 2500,
         "ENABLE_RECALL_GUARD": True,
         "RECALL_BACKFILL": 50,
         "RECALL_SCAN_INTERVAL": 2.0,
@@ -3781,7 +4001,7 @@ if __name__ == '__main__':
 
     print("\033[32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m")
     print("\033[32m✅ 配置编辑器启动成功！\033[0m")
-    print("\033[32m✅ 当前版本为：version：2.2.6.1\033[0m")
+    print("\033[32m✅ 当前版本为：version：2.2.7\033[0m")
     print("\033[32m⚠️ 请注意PC端微信\033[0m")
     print("\033[32m🈲 禁止登录新注册小号，极大几率封号\033[0m")
     print("\033[32m☣️ 买来你就被骗了，倒卖死全家喔\033[0m")
