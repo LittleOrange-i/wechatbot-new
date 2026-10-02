@@ -1,3 +1,13 @@
+# v2.2.7.1 (2026年10月02日)
+
+## 仅文档：免安装离线包
+
+- `readme.md` 新增「免安装离线包（不用装 Python）」一节，给出 zip 直链与用法。**代码、依赖、配置项零改动**，`2.2.7 → 2.2.7.1` 只是为了让这条链接出现在 PyPI 的项目描述里（PyPI 不允许给已发布的版本补文件或改描述）。
+- 离线包是一个自包含目录：官方嵌入式 Python 3.12.9 + 本项目全部依赖装在 `Lib\site-packages` + 项目源码平铺在根目录。目标机不需要装 Python、不需要联网、不需要管理员权限，也不打成 exe（打成 exe 会被杀软按行为特征误报）。
+- 入口：`start.bat`（配置网页）、`wx.bat 脚本.py`（包内解释器跑任意脚本）、`diagnose.bat` / `check_env.py`（自检能否解密本地数据库、读到哪些监听用户）。
+- 出厂 `config.py` 是占位内容（`微信名1` / `角色1`，`HISTORY_STYLE_USERS` 为空）；包内不含 `HistoryProfiles`、`chat_contexts.json`、`CoreMemory`、密钥缓存、日志，也不含 `Run.exe`（它的第一步是往系统 Python 里 `pip install`，目标机没有系统 Python）。
+- 出包脚本在仓库外：`tools/make_offline_bundle_wechatbot.py`（与 `wechatauto-offline` 同一套路）。它自带一道验收闸门（56 项：版本、源码能否编译、30 个运行时依赖能否 import、关键文件与目录是否齐、配置是否占位、DPI awareness 是否 `PER_MONITOR_AWARE_V2`、可选真实取密钥），本次是**把 zip 解压出来再跑闸门**通过的，不是对着打包目录跑的。
+
 # v2.2.7 (2026年10月01日)
 
 ## 新增：用聊天记录生成「模仿我」的风格档案（替代该用户的 Prompt）
