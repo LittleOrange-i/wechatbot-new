@@ -23,6 +23,7 @@ import random
 from typing import Optional
 import shutil
 import re
+import ast
 from config import *
 import queue
 import json
@@ -149,10 +150,12 @@ def get_dynamic_config(key, default_value=None):
             elif value_str.replace('.', '').isdigit():
                 return float(value_str)
             else:
-                # 尝试eval（注意：在生产环境中需要更安全的方法）
+                # 以前这里是 eval()：config.py 里写什么就会被执行什么。
+                # literal_eval 只认字面量（列表/字典/字符串/数字/True/False/None），
+                # 认不出来的走下面去引号那条兜底。
                 try:
-                    return eval(value_str)
-                except:
+                    return ast.literal_eval(value_str)
+                except Exception:
                     return value_str.strip("'\"")
         return default_value
     except Exception as e:
@@ -803,7 +806,7 @@ def read_history_context(user_id, force=False):
                 history_context_warned.add(user_id)
         if first_time:
             logger.warning(
-                f"用户 {user_id} 读不到聊天记录（解析到的会话={username or '无'}）。"
+                f"用户 {user_id} 读不到聊天记录（解析到的会话={_uname or '无'}）。"
                 f"常见原因：LISTEN_LIST 里的昵称和微信显示名不完全一致，或这个会话本地确实没有记录。"
                 f"之后同一条会话不再重复提醒。")
         return cached
@@ -1178,6 +1181,7 @@ def call_chat_api_with_retry(messages_to_send, user_id, max_retries=2, is_summar
         raise RuntimeError("抱歉，您所使用的API服务商不受信任，请联系网站管理员")
 
     attempt = 0
+    last_error = ""
     while attempt <= max_retries:
         try:
             logger.debug(f"发送给 API 的消息 (ID: {user_id}): {messages_to_send}")
@@ -1221,6 +1225,7 @@ def call_chat_api_with_retry(messages_to_send, user_id, max_retries=2, is_summar
             logger.error(f"错误请求消息体: {MODEL}")
             logger.error(json.dumps(messages_to_send, ensure_ascii=False, indent=2))
             error_info = str(e)
+            last_error = error_info
             logger.error(f"自动重试：第 {attempt + 1} 次调用 {MODEL}失败 (ID: {user_id}) 原因: {error_info}", exc_info=False)
 
             # 细化错误分类
@@ -1251,7 +1256,10 @@ def call_chat_api_with_retry(messages_to_send, user_id, max_retries=2, is_summar
 
         attempt += 1
 
-    raise RuntimeError("阿文提示：api余额不足")
+    # 以前这里不分原因一律报「api余额不足」：超时、上下文超长、本地代码抛错
+    # 都会被当成"你去充值"。现在把最后一次真实原因带出去（没抛过异常就是返回空）。
+    raise RuntimeError("阿文提示：调用 %s 失败（第 %d 次尝试后放弃）：%s"
+                       % (MODEL, attempt, last_error or "模型连续返回空内容，见上方日志"))
 
 def get_assistant_response(message, user_id, is_summary=False):
     """
@@ -1733,6 +1741,10 @@ def message_listener(msg, chat):
         else:
             handle_wxauto_message(msg, who)
 
+LLM_HTTP_TIMEOUT = 180   # 识图这类多模态调用比抓网页慢得多，不能复用 REQUESTS_TIMEOUT(10s)；
+                         # requests 不传 timeout 是"永远等"，一个不响应的端点会挂死这个线程
+
+
 def recognize_image(image_path, is_emoji=False):
     """调 OpenAI 兼容的视觉接口识别图片/表情包，返回描述文本。
 
@@ -1777,7 +1789,8 @@ def recognize_image(image_path, is_emoji=False):
             "temperature": MOONSHOT_TEMPERATURE
         }
         
-        response = requests.post(f"{MOONSHOT_BASE_URL}/chat/completions", headers=headers, json=data)
+        response = requests.post(f"{MOONSHOT_BASE_URL}/chat/completions", headers=headers,
+                                 json=data, timeout=LLM_HTTP_TIMEOUT)
         if response.status_code != 200:
             # 换服务商时最容易踩请求体不合规（例如图片没放在 user 消息里），
             # raise_for_status 的异常不带响应体，这里把服务端原文打出来
@@ -1963,24 +1976,39 @@ def _extract_command_from_text(raw_text: str) -> Optional[str]:
         return None
 
 def _update_config_boolean(key: str, value: bool) -> bool:
-    """在 config.py 中更新布尔配置，同时更新内存变量。失败返回 False。"""
+    """在 config.py 中更新布尔配置，同时更新内存变量。失败返回 False。
+
+    锁路径和配置编辑器用的是同一个 ``config.py.lock``：以前这里是第二个写者、
+    不上锁，网页端正在保存时机器人改开关会互相覆盖。
+    """
+    try:
+        from filelock import FileLock
+    except ImportError:
+        logger.error("缺少 filelock，拒绝改写 config.py（会和配置编辑器抢写）")
+        return False
     try:
         config_path = os.path.join(root_dir, 'config.py')
         if not os.path.exists(config_path):
             logger.error(f"配置文件不存在: {config_path}")
             return False
-        with open(config_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        pattern = rf"^({re.escape(key)})\s*=\s*(True|False|.+)$"
         replacement = f"{key} = {str(bool(value))}"
-        new_content, count = re.subn(pattern, replacement, content, flags=re.M)
-        if count == 0:
-            # 若不存在该项，则追加
-            new_content = content.rstrip("\n") + f"\n\n{replacement}\n"
-        tmp_path = config_path + '.tmp'
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            f.write(new_content)
-        shutil.move(tmp_path, config_path)
+        with FileLock(config_path + '.lock'):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            # 只认 True/False 两种现值。以前带 `|.+$`：键的值要是写成跨行的列表，
+            # 它只替换第一行、把续行留下，config.py 当场变语法错误。
+            new_content, count = re.subn(
+                rf"^({re.escape(key)})\s*=\s*(True|False)$", replacement, content, count=1,
+                flags=re.M)
+            if count == 0:
+                if re.search(rf"^{re.escape(key)}\s*=", content, re.M):
+                    logger.error(f"config.py 里 {key} 的现值不是 True/False，拒绝改写")
+                    return False
+                new_content = content.rstrip("\n") + f"\n\n{replacement}\n"
+            tmp_path = config_path + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            shutil.move(tmp_path, config_path)
         # 同步到内存
         try:
             globals()[key] = bool(value)

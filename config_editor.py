@@ -445,7 +445,7 @@ def submit_config():
             'IGNORE_GROUP_CHAT_FOR_AUTO_MESSAGE', 'ENABLE_SENSITIVE_CONTENT_CLEARING', 'SAVE_MEMORY_TO_SEPARATE_FILE',
             'ENABLE_TEXT_COMMANDS', 'ENABLE_RECALL_GUARD', 'ENABLE_MOMENTS_COMMAND',
             'ENABLE_RECALL_NOTICE', 'ENABLE_MOMENTS_INTERACTIONS', 'ENABLE_MOMENTS_WATCH',
-            'ENABLE_CONTEXT_FETCH'
+            'ENABLE_CONTEXT_FETCH', 'ENABLE_URL_FETCHING'
         ]
         for field in boolean_fields:
             new_values_for_config_py[field] = field in request.form
@@ -4001,7 +4001,7 @@ if __name__ == '__main__':
 
     print("\033[32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m")
     print("\033[32m✅ 配置编辑器启动成功！\033[0m")
-    print("\033[32m✅ 当前版本为：version：2.2.7.1\033[0m")
+    print("\033[32m✅ 当前版本为：version：2.2.8\033[0m")
     print("\033[32m⚠️ 请注意PC端微信\033[0m")
     print("\033[32m🈲 禁止登录新注册小号，极大几率封号\033[0m")
     print("\033[32m☣️ 买来你就被骗了，倒卖死全家喔\033[0m")

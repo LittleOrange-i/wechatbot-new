@@ -4115,7 +4115,12 @@ document.getElementById('oneKeyDiagnosticButton').addEventListener('click', asyn
                                 <label>启用表情包识别功能</label>
                                 <div class="switch"><label class="switch-label"><input type="checkbox" name="ENABLE_EMOJI_RECOGNITION" {% if config.ENABLE_EMOJI_RECOGNITION %}checked{% endif %}><span class="slider round"></span></label></div>
                             </div>
+                            <div class="switch-item">
+                                <label>抓取消息里的网页链接</label>
+                                <div class="switch"><label class="switch-label"><input type="checkbox" name="ENABLE_URL_FETCHING" {% if config.ENABLE_URL_FETCHING %}checked{% endif %}><span class="slider round"></span></label></div>
+                            </div>
                         </div>
+                        <small>开着时，对方消息里的网页会被抓正文当成参考信息一起给模型；关掉则只把链接原样带过去。图片/表情识别走的是另一个接口，不受这项影响。</small>
                     </div>
                     <div class="form-group">
                         <label>图像识别API服务商：</label>

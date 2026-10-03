@@ -133,6 +133,40 @@ def _split_sender_prefix(text):
     return None, text
 
 
+_MERGE_ITEM_RE = re.compile(r"<item\b([^>]*?)(?:/>|>(.*?)</item>)", re.S)
+_MERGE_ATTR_RE = re.compile(r'([\w:]+)\s*=\s*"([^"]*)"')
+_MERGE_SENDER_KEYS = ("sname", "sendernickname", "sendername", "sender")
+_MERGE_TEXT_KEYS = ("msg", "msgdata", "content", "title", "digest")
+_MERGE_TIME_KEYS = ("asmantime", "time", "timestamp", "createtime")
+_MERGE_ENTITIES = (("&quot;", '"'), ("&apos;", "'"), ("&lt;", "<"),
+                   ("&gt;", ">"), ("&#x0a;", "\n"), ("&#10;", "\n"), ("&amp;", "&"))
+
+
+def _parse_merge_records(blob):
+    """合并转发（``<record>`` 里的 ``<item>``）拆成 ``[[发送者, 内容, 时间], ...]``。
+
+    bot 侧按三元素列表消费（``bot.py`` 的 ``msgtype == 'merge'`` 分支）。各版本属性名
+    不一致，所以每个字段给一串候选键；整条解析不出来返回 ``[]``。以前 ``_merge``
+    从没被赋过值，``get_messages()`` 永远返回 None —— 合并转发的内容对模型就是空的。
+    """
+    out = []
+    for m in _MERGE_ITEM_RE.finditer(blob or ""):
+        attrs = {k.lower(): v for k, v in _MERGE_ATTR_RE.findall(m.group(1) or "")}
+        inner = m.group(2) or ""
+        sender = next((attrs[k] for k in _MERGE_SENDER_KEYS if attrs.get(k)), "")
+        text = next((attrs[k] for k in _MERGE_TEXT_KEYS if attrs.get(k)), "")
+        text = text or _tag_val(inner, "title", "msg", "content", "desc")
+        for a, b in _MERGE_ENTITIES:
+            text = text.replace(a, b)
+            sender = sender.replace(a, b)
+        ts = next((attrs[k] for k in _MERGE_TIME_KEYS if attrs.get(k)), "")
+        stamp = time.strftime("%m-%d %H:%M", time.localtime(int(ts))) if ts.isdigit() else ""
+        text = _strip_tags(text or "").strip()
+        if text:
+            out.append([sender or "未知", text, stamp])
+    return out
+
+
 def _fold_xml_content(text, type_cn):
     """把消息正文里的整坨 XML 折成一行人类可读的话。
 
@@ -328,9 +362,12 @@ def read_history_text(who, limit=30, max_chars=4000, db=None):
         wxlog.warning("读取聊天记录失败 (%s): %s" % (who, e))
         return uname, ""
     is_group = uname.endswith("@chatroom")
-    peer_nick = "" if is_group else (nick_of(uname) or uname)
+    # 群里的"对方"不是一个人：正文里没有 wxid 前缀的那几条（图片/表情/语音）
+    # 只能标成一个不带名字的群成员，别拿串号的名字冒充，也别写成"对方"骗模型是一对一。
+    peer_nick = "群成员" if is_group else (nick_of(uname) or uname)
     return uname, format_history_rows(rows, nick_of, peer_nick=peer_nick,
-                                       max_chars=_as_int(max_chars, 0))
+                                       max_chars=_as_int(max_chars, 0),
+                                       self_ids=resolve_self_ids(text_db, uname, rows))
 
 
 def _as_int(value, default=0):
@@ -340,8 +377,113 @@ def _as_int(value, default=0):
         return default
 
 
+_XML_SELF_RE = re.compile(r'fromusername\s*=\s*["\']?\s*([A-Za-z0-9_\-@]+)')
+_MSG_TABLE_RE = re.compile(r'^Msg_[0-9a-f]{32}$')
+_SENDER_PREFIX_RE = re.compile(r"^(wxid_[^\s:\n]+|gh_[^\s:\n]+|\d{6,}):\n")
+
+
+def status_votes(db, username, since=0, until=0, cap=0):
+    """``{sender_id: [条数, 其中 status==2 的条数]}``。
+
+    ``status`` 不在 ``get_messages()`` 的返回里，只能自己开分片读；读不到就回空表，
+    调用方退到「只看 XML」这一条证据上。
+
+    窗口参数是给热路径留的：历史格式化只查被格式化的那批消息的时间跨度
+    （``since``/``until``），实时判定只看这个会话最近的 ``cap`` 条 ——
+    一个几万条的群全表扫一遍是不能放在收消息的循环里的。
+    """
+    out = {}
+    try:
+        conns = db._msg_conns(username)
+    except Exception as e:
+        wxlog.warning("读 status 失败（只用 XML 证据判定「我」）: %s" % e)
+        return {}
+    for conn, table in conns or []:
+        if not _MSG_TABLE_RE.match(str(table)):          # 表名进 SQL 前先卡死格式
+            continue
+        sql = 'SELECT real_sender_id, status FROM "%s"' % table
+        args = []
+        if since and until:
+            sql += " WHERE create_time BETWEEN ? AND ?"
+            args += [int(since), int(until)]
+        if cap:
+            sql += " ORDER BY sort_seq DESC LIMIT ?"
+            args.append(int(cap))
+        try:
+            for sid, st in conn.execute(sql, args):
+                v = out.setdefault(str(sid), [0, 0])
+                v[0] += 1
+                if st == 2:
+                    v[1] += 1
+        except Exception as e:
+            wxlog.warning("分片 %s 读 status 失败: %s" % (table, e))
+    return out
+
+
+def classify_senders(rows, own_wxid, votes):
+    """这个会话里哪些 ``sender_id`` 是「我」，返回 ``(self_ids, 证据列表)``。
+
+    ``real_sender_id`` 是**分片内**的短编号，同一个人换个分片就换个号：本机实测
+    2025-07~2026-02 自己是 4、2026-06 之后是 2，所以 ``== 2`` 会把整段旧历史里的
+    我算成对方（风格档案于是描述的是对方的口吻）。只认两条正向证据：
+    ① ``status == 2``（微信给自己发的消息打的标，跨分片稳）；
+    ② 表情/图片 XML 里的 ``fromusername`` == 本机 wxid。
+    整场都没有正向证据才退回 ``== 2``；只要判得出「我」，剩下的 id 一律算对方
+    —— 群里十几个成员编号，不该有一个靠 ``== 2`` 混进来。
+    """
+    win, xml = {}, {}
+    for r in rows or []:
+        sid = str(r.get("sender_id"))
+        win[sid] = win.get(sid, 0) + 1
+        m = _XML_SELF_RE.search(_to_text(r.get("content")))
+        if m and own_wxid and m.group(1) == own_wxid:
+            xml[sid] = xml.get(sid, 0) + 1
+    self_ids, ev = set(), []
+
+    def positive(sid):
+        n, st2 = votes.get(sid, [0, 0])
+        return st2 >= max(1, int(0.3 * n)) or bool(xml.get(sid))
+
+    decided = any(positive(s) for s in set(list(win) + list(votes)))
+    for sid in sorted(set(list(win) + list(votes))):
+        n, st2 = votes.get(sid, [0, 0])
+        x = xml.get(sid, 0)
+        if st2 >= max(1, int(0.3 * n)):
+            is_self, how = True, "status=2 占 %d/%d" % (st2, n)
+        elif x:
+            is_self, how = True, "表情 XML 里 fromusername 是本机号，%d 条" % x
+        elif not decided and sid == "2":
+            is_self, how = True, "整场都没有正向证据，退回 sender_id==2"
+        else:
+            is_self, how = False, "无正向证据（status=2 只有 %d/%d）" % (st2, n)
+        if is_self:
+            self_ids.add(sid)
+        ev.append((sid, win.get(sid, 0), is_self, how))
+    return self_ids, ev
+
+
+def resolve_self_ids(db, username, rows=None, cap=0):
+    """历史/实时两条路共用的入口：拿本机 wxid + status 证据，判出「我」的编号集合。"""
+    try:
+        own = (getattr(db, "wxid", "") or "").strip()
+    except Exception:
+        own = ""
+    since = until = 0
+    if rows:
+        ts = [_as_int(r.get("create_time")) for r in rows if _as_int(r.get("create_time"))]
+        if ts:
+            since, until = min(ts), max(ts)
+    try:
+        votes = status_votes(db, username, since=since, until=until, cap=cap)
+    except Exception as e:
+        wxlog.warning("判定「我」的 sender_id 失败（退回 sender_id==2）: %s" % e)
+        votes = {}
+    ids, _ev = classify_senders(rows or [], own, votes)
+    return ids
+
+
 def format_history_rows(rows, nick_of=None, self_nick="我", peer_nick="",
-                        max_chars=0):
+                        max_chars=0, self_ids=None):
     """把 ``db.get_messages()`` 的消息行转成可读文本，用于喂给模型。
 
     每行 ``[月-日 时:分] 名字：内容``。行序按 ``sort_seq``（同值时按 ``local_id``）
@@ -361,27 +503,30 @@ def format_history_rows(rows, nick_of=None, self_nick="我", peer_nick="",
     """
     ordered = sorted(rows or [], key=lambda r: (_as_int(r.get("sort_seq")),
                                                 _as_int(r.get("local_id"))))
+    self_ids = self_ids if self_ids else {"2"}
     lines = []
     for row in ordered:
         type_cn = row.get("type") or ""
         if type_cn in ("系统消息", "撤回消息"):
             continue
         content = _to_text(row.get("content")).strip()
+        m = _SENDER_PREFIX_RE.match(content)
         if type_cn and type_cn != "文本":
             # 语音/图片/表情这些没有可直接模仿的文字，只留类型标记
             content = "[%s]" % type_cn
         else:
-            content = re.sub(
-                r"^(wxid_[^\s:\n]+|gh_[^\s:\n]+|\d{6,}):\n", "", content).strip()
+            content = (content[m.end():] if m else content).strip()
         if not content:
             continue
         sender_id = row.get("sender_id")
-        if sender_id in (2, "2"):
+        if str(sender_id) in self_ids:
             who = self_nick
+        elif m:
+            # 群里：正文前缀里的 wxid 才是发送者。sender_username 拿的是
+            # message_resource 的全局 rowid，跨分片会串号，不能用来认人。
+            who = (nick_of(m.group(1)) if nick_of else "") or m.group(1)
         else:
-            wxid = str(row.get("sender_username") or "").strip()
-            name = (nick_of(wxid) if wxid and nick_of else "") or wxid
-            who = name or peer_nick or "对方"
+            who = peer_nick or "对方"
         ts = _as_int(row.get("create_time"))
         stamp = time.strftime("%m-%d %H:%M", time.localtime(ts)) if ts else "时间未知"
         lines.append("[%s] %s：%s" % (stamp, who, content))
@@ -394,7 +539,7 @@ def format_history_rows(rows, nick_of=None, self_nick="我", peer_nick="",
 class WxMessage:
     """bot 兼容消息对象（对齐 wxautox4_wechatbot 的消息接口）"""
 
-    def __init__(self, row, chat, db, media, self_wxid):
+    def __init__(self, row, chat, db, media, self_wxid, self_ids=None):
         self._row = row
         self._chat = chat
         self._db = db
@@ -413,7 +558,10 @@ class WxMessage:
             self._chat
             and str(getattr(self._chat, "_wxid", "")).endswith("@chatroom")
         )
-        is_self = sender_id in (2, "2") or str(sender_id) == self._self_wxid
+        # self_ids 由调用方按 status/XML 证据判好传进来（一个会话算一次，见
+        # WeChat._make_listen_cb）。real_sender_id 是分片内的短编号，写死 ==2
+        # 在换过分片编号的机器上会把"我"当成"对方"，于是自己回复自己。
+        is_self = str(sender_id) in (self_ids or {"2"})
         self.attr = "self" if is_self else "friend"
 
         content = _to_text(row.get("content"))
@@ -491,12 +639,12 @@ class WxMessage:
             # 群里先用真 wxid 换名字：图片/文件/语音这些类型正文里没有
             # "wxid_xxx:\n" 前缀，旧实现只能回落到一个无意义的数字。
             name = self._nickname_of(self.sender_wxid) or self._nickname_of(prefix)
-            return name or str(sender_id)
+            return name or ("群成员%s" % sender_id if str(sender_id).isdigit() else str(sender_id))
         # 私聊：对方就是聊天窗口本身
         try:
-            return self._chat.who or str(sender_id)
+            return self._chat.who or "对方"
         except Exception:
-            return str(sender_id)
+            return "对方"
 
     @staticmethod
     def _clean_content(content, prefix, type_cn=""):
@@ -524,6 +672,7 @@ class WxMessage:
                 return
             if "<record" in blob:
                 self.type = "merge"
+                self._merge = _parse_merge_records(blob)
                 return
 
             # 链接卡片：只认卡面 <url> 里的网页地址。以前是「blob 里有 http 就算链接」，
@@ -557,7 +706,7 @@ class WxMessage:
         return self._link_url
 
     def get_messages(self):
-        return self._merge
+        return self._merge or []
 
     def voice_status(self):
         """这条语音的音频到底在不在本地（委托 wechatauto 的 voice_status）。
@@ -715,10 +864,17 @@ class WeChat(_BaseWeChat):
             self_wxid = self._db.get_self_info()["username"]
         except Exception:
             pass
+        # 一个会话只判一次（订阅时），不放在每条消息的回调里。cap=400：只看这个
+        # 会话最近的几百条，几万条的群不做全表扫。
+        wxid = str(getattr(chat, "_wxid", "") or "")
+        self_ids = resolve_self_ids(self._db, wxid, cap=400) if wxid else set()
+        if wxid:
+            wxlog.info("会话 %s 的「我」= sender_id %s"
+                       % (wxid, "、".join(sorted(self_ids)) or "（未判出，按 2 兜底）"))
 
         def _wrapper(row, listener):
             try:
-                msg = WxMessage(row, chat, self._db, self._media, self_wxid)
+                msg = WxMessage(row, chat, self._db, self._media, self_wxid, self_ids)
                 callback(msg, chat)
             except Exception:
                 import traceback
