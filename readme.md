@@ -70,8 +70,8 @@
 
 不想在目标机上装 Python、也不想联网拉依赖，可以直接用离线包：一个自包含目录，里面是官方嵌入式 Python 3.12 运行时 + 本项目全部依赖，解压即用，不需要管理员权限。
 
-- **下载**：`wechatbot-new-offline-2.2.7.zip`（142 MB，解压后 406 MB，5691 个文件）
-  https://livefile.xesimg.com/programme/python_assets/cf1b5c02b7c200b6da614e373b7ed475.zip
+- **下载**：`wechatbot-new-offline-2.2.8.1.zip`（142.6 MB，解压后 393 MB，4700 个文件 + 889 个目录条目）
+  https://livefile.xesimg.com/programme/python_assets/38b0312752cece199400864abf0f67aa.zip
 - **怎么用**：解压后双击 `start.bat` 打开配置网页（登录微信 → 填 API → Start Bot）；`wx.bat 你的脚本.py` 用包内 Python 跑任意脚本；`diagnose.bat` 自检能不能解密本地数据库；`README-offline.md` 是完整说明。
 - **前提**：64 位 Windows 10/11，微信 4.1.12 及以上且已登录；**不要「以管理员身份运行」**——微信以普通权限运行时，提权进程读它的内存会被系统拒绝，表现为取不到密钥。
 - **出厂配置是占位内容**（`微信名1` / `角色1`），包内不含任何人的昵称或聊天记录；数据库密钥缓存在 `%LOCALAPPDATA%\wechatauto_keys\`、风格档案与节流配置在 `%USERPROFILE%\.wechatauto\`，都写在当前用户目录、不跟着包走，别把这两个目录发给别人。
